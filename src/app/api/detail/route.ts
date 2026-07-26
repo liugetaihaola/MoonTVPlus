@@ -3,6 +3,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getAuthInfoFromCookie } from '@/lib/auth';
 import { getAvailableApiSites, getCacheTime, getConfig } from '@/lib/config';
 import { getDetailFromApi } from '@/lib/downstream';
+import {
+  executeSavedSourceScript,
+  normalizeScriptDetailResult,
+  normalizeScriptSources,
+  parseScriptSourceValue,
+} from '@/lib/source-script';
 
 export const runtime = 'nodejs';
 
@@ -15,9 +21,53 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const id = searchParams.get('id');
   const sourceCode = searchParams.get('source');
+  const includeSpecialSources = searchParams.get('special') === '1';
 
   if (!id || !sourceCode) {
     return NextResponse.json({ error: '缺少必要参数' }, { status: 400 });
+  }
+
+  const parsedScriptSource = parseScriptSourceValue(sourceCode);
+  if (parsedScriptSource) {
+    try {
+      const sourcesExecution = await executeSavedSourceScript({
+        key: parsedScriptSource.scriptKey,
+        hook: 'getSources',
+        payload: {},
+      });
+      const sources = normalizeScriptSources(sourcesExecution.result);
+      const sourceInfo =
+        sources.find((item) => item.id === parsedScriptSource.sourceId) || {
+          id: parsedScriptSource.sourceId,
+          name: parsedScriptSource.sourceId,
+        };
+
+      const detailExecution = await executeSavedSourceScript({
+        key: parsedScriptSource.scriptKey,
+        hook: 'detail',
+        payload: {
+          id,
+          sourceId: parsedScriptSource.sourceId,
+        },
+      });
+
+      const normalized = normalizeScriptDetailResult({
+        source: sourceCode,
+        scriptKey: parsedScriptSource.scriptKey,
+        scriptName: detailExecution.meta?.name || parsedScriptSource.scriptKey,
+        sourceId: parsedScriptSource.sourceId,
+        sourceName: sourceInfo.name,
+        detailId: id,
+        result: detailExecution.result,
+      });
+
+      return NextResponse.json(normalized);
+    } catch (error) {
+      return NextResponse.json(
+        { error: (error as Error).message },
+        { status: 500 }
+      );
+    }
   }
 
   // 特殊处理 openlist 源
@@ -155,6 +205,12 @@ export async function GET(request: NextRequest) {
 
       // 3. 从 metainfo 中获取元数据
       const { getTMDBImageUrl } = await import('@/lib/tmdb.search');
+      const { resolvePathMeta } = await import('@/lib/openlist-path-meta');
+      // folderName 为 metainfo 完整路径，PathMeta 最长前缀匹配
+      const pathMetaResolved = resolvePathMeta(
+        folderName,
+        openListConfig.PathMeta
+      );
 
       const result = {
         source: 'openlist',
@@ -168,6 +224,8 @@ export async function GET(request: NextRequest) {
         episodes: episodes.map((ep) => `/api/openlist/play?folder=${encodeURIComponent(folderName)}&fileName=${encodeURIComponent(ep.fileName)}`),
         episodes_titles: episodes.map((ep) => ep.title),
         proxyMode: false, // openlist 源不使用代理模式
+        category: pathMetaResolved.category || undefined,
+        refresh14m: pathMetaResolved.refresh14m,
       };
 
       return NextResponse.json(result);
@@ -184,7 +242,7 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const apiSites = await getAvailableApiSites(authInfo.username);
+    const apiSites = await getAvailableApiSites(authInfo.username, includeSpecialSources);
     const apiSite = apiSites.find((site) => site.key === sourceCode);
 
     if (!apiSite) {
